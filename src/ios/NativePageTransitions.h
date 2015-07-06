@@ -10,8 +10,14 @@
 
 @property (strong, nonatomic) IBOutlet UIView *transitionView;
 @property (strong, nonatomic) IBOutlet WKWebView *wkWebView;
-@property (nonatomic, assign) int nonWebViewHeight;
 
+@property (nonatomic, assign) int nonWebViewHeight;
+@property (nonatomic, assign) CGRect webviewFrom;
+@property (nonatomic, assign) CGRect webviewTo;
+@property (nonatomic, assign) CGRect screenshotFrom;
+@property (nonatomic, assign) CGRect screenshotTo;
+
+- (void) prepareForAnimation:(CDVInvokedUrlCommand*)command;
 - (void) slide:(CDVInvokedUrlCommand*)command;
 - (void) drawer:(CDVInvokedUrlCommand*)command;
 - (void) flip:(CDVInvokedUrlCommand*)command;

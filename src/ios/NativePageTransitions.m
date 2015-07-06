@@ -23,9 +23,14 @@
       }
     }
   }
-  
+
+  // This is taken from the slide: method. It doesn't need to be set every time we slide, and if it does, it should set the Color back to what it was before sliding. Just leave it here for now.
+  self.viewController.view.backgroundColor = [UIColor blackColor];
+    
+    _screenShotImageView = [[UIImageView alloc]initWithFrame: self.viewController.view.frame];
+
   // webview height may differ from screen height because of a statusbar
-  _nonWebViewHeight = screenBound.size.width-self.transitionView.frame.size.width + screenBound.size.height-self.transitionView.frame.size.height;
+  _nonWebViewHeight = screenBound.size.width - self.transitionView.frame.size.width + screenBound.size.height - self.transitionView.frame.size.height;
   return self;
 }
 
@@ -38,13 +43,234 @@
   [super dispose];
 }
 
+
+#pragma mark - New shit:
+
+- (void) prepareForAnimation:(CDVInvokedUrlCommand*)command {
+    _command = command;
+    NSMutableDictionary *args = [command.arguments objectAtIndex:0];
+
+    // Set up the instance variables for our animation
+    [self createFramesForSlideAnimationWithArguments:args];
+    
+    NSString *direction = [args objectForKey:@"direction"];
+    NSNumber *fixedPixelsTopNum = [args objectForKey:@"fixedPixelsTop"];
+    NSNumber *fixedPixelsBottomNum = [args objectForKey:@"fixedPixelsBottom"];
+    int fixedPixelsTop = [fixedPixelsTopNum intValue];
+    int fixedPixelsBottom = [fixedPixelsBottomNum intValue];
+    
+    self.transitionView.layer.shadowOpacity = 0;
+    
+    // Perform the screenshot (which takes the most time by far) in a background thread
+    // http://stackoverflow.com/questions/10931155/uigraphicsbeginimagecontextwithoptions-and-multithreading
+    
+    [[self commandDelegate] runInBackground:^{
+        
+        CGSize viewSize = self.viewController.view.bounds.size;
+        UIGraphicsBeginImageContextWithOptions(viewSize, YES, 0.0);
+        
+        // Since drawViewHierarchyInRect is slower than renderInContext we should only
+        // use it to overcome the bug in WKWebView
+        if (self.wkWebView != nil) {
+            [self.wkWebView drawViewHierarchyInRect:self.wkWebView.bounds afterScreenUpdates:NO];
+        } else {
+            [self.viewController.view.layer renderInContext:UIGraphicsGetCurrentContext()];
+        }
+        
+        // Read the UIImage object
+        UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        
+        dispatch_async(dispatch_get_main_queue(), ^{
+            
+            _screenShotImageView.alpha = 1.0f;
+            
+            CGFloat retinaFactor = DISPLAY_SCALE;
+            
+            // In case of a statusbar above the webview, crop the top off our screenshot
+            if (_nonWebViewHeight > 0 && [direction isEqualToString:@"down"]) {
+                CGRect imageSize = CGRectMake(0.0, _nonWebViewHeight*retinaFactor, image.size.width*retinaFactor, (image.size.height-_nonWebViewHeight)*retinaFactor);
+                CGRect imageFrameSize = CGRectMake(0.0, _nonWebViewHeight, image.size.width, image.size.height-_nonWebViewHeight);
+                CGImageRef tempImage = CGImageCreateWithImageInRect([image CGImage], imageSize);
+                _screenShotImageView.frame = imageFrameSize;
+                [_screenShotImageView setImage:[UIImage imageWithCGImage:tempImage]];
+                CGImageRelease(tempImage);
+            } else {
+                // Otherwise just set the screenshot as normal:
+                _screenShotImageView.frame = _screenshotFrom;
+                [_screenShotImageView setImage:image];
+            }
+
+            if ([direction isEqualToString:@"left"] || [direction isEqualToString:@"up"]) {
+                [self.transitionView.superview insertSubview:_screenShotImageView belowSubview:self.transitionView];
+            } else {
+                [self.transitionView.superview insertSubview:_screenShotImageView aboveSubview:self.transitionView];
+            }
+
+            
+            // Make a cropped version of the screenshot with only the top and/or bottom piece. Only for left/right slides atm.
+            if ([direction isEqualToString:@"left"] || [direction isEqualToString:@"right"]) {
+                if (fixedPixelsTop > 0) {
+                    CGRect imageSize = CGRectMake(0.0, _nonWebViewHeight*retinaFactor, image.size.width*retinaFactor, fixedPixelsTop*retinaFactor);
+                    CGRect imageFrameSize = CGRectMake(0.0, _nonWebViewHeight, image.size.width, fixedPixelsTop);
+                    CGImageRef tempImage = CGImageCreateWithImageInRect([image CGImage], imageSize);
+                    _screenShotImageViewTop = [[UIImageView alloc]initWithFrame:imageFrameSize];
+                    [_screenShotImageViewTop setImage:[UIImage imageWithCGImage:tempImage]];
+                    CGImageRelease(tempImage);
+                    [self.transitionView.superview insertSubview:_screenShotImageViewTop aboveSubview:([direction isEqualToString:@"left"] ? self.transitionView : self.screenShotImageView)];
+                }
+                if (fixedPixelsBottom > 0) {
+                    CGRect imageSize = CGRectMake(0.0, (image.size.height-fixedPixelsBottom)*retinaFactor, image.size.width*retinaFactor, fixedPixelsBottom*retinaFactor);
+                    CGRect imageFrameSize = CGRectMake(0.0, image.size.height-fixedPixelsBottom, image.size.width, fixedPixelsBottom);
+                    CGImageRef tempImage = CGImageCreateWithImageInRect([image CGImage], imageSize);
+                    _screenShotImageViewBottom = [[UIImageView alloc]initWithFrame:imageFrameSize];
+                    [_screenShotImageViewBottom setImage:[UIImage imageWithCGImage:tempImage]];
+                    CGImageRelease(tempImage);
+                    [self.transitionView.superview insertSubview:_screenShotImageViewBottom aboveSubview:([direction isEqualToString:@"left"] ? self.transitionView : self.screenShotImageView)];
+                }
+            }
+        
+            // Put the webview in position, ready to start animation
+            [self.transitionView setFrame:_webviewFrom];
+        });
+        
+        CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+        [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+
+    }];
+}
+
+
+- (void) createFramesForSlideAnimationWithArguments:(NSDictionary*)args {
+    
+    NSString *direction = [args objectForKey:@"direction"];
+    NSNumber *slowdownfactor = [args objectForKey:@"slowdownfactor"];
+    
+    CGFloat transitionToX = 0;
+    CGFloat transitionToY = 0;
+    CGFloat webviewFromY = _nonWebViewHeight;
+    CGFloat webviewToY = _nonWebViewHeight;
+    int screenshotSlowdownFactor = 1;
+    int webviewSlowdownFactor = 1;
+    
+    CGFloat width = self.viewController.view.frame.size.width;
+    CGFloat height = self.viewController.view.frame.size.height;
+    
+    _screenshotFrom = [self.viewController.view.window frame];
+    
+    // correct landscape detection on iOS < 8
+    if ([self isLandscape] && width < height) {
+        _screenshotFrom = [self switchCGRectOrientation:_screenshotFrom];
+        CGFloat temp = width;
+        width = height;
+        height = temp;
+    }
+    
+    if ([direction isEqualToString:@"left"]) {
+        transitionToX = -width;
+        screenshotSlowdownFactor = [slowdownfactor intValue];
+    } else if ([direction isEqualToString:@"right"]) {
+        transitionToX = width;
+        webviewSlowdownFactor = [slowdownfactor intValue];
+    } else if ([direction isEqualToString:@"up"]) {
+        screenshotSlowdownFactor = [slowdownfactor intValue];
+        transitionToY = (-height/screenshotSlowdownFactor)+_nonWebViewHeight;
+        webviewToY = _nonWebViewHeight;
+        webviewFromY = height/webviewSlowdownFactor;
+    } else if ([direction isEqualToString:@"down"]) {
+        transitionToY = (height/screenshotSlowdownFactor)+_nonWebViewHeight;
+        webviewSlowdownFactor = [slowdownfactor intValue];
+        webviewFromY = (-height/webviewSlowdownFactor)+_nonWebViewHeight;
+    }
+    
+    _webviewFrom = CGRectMake(-transitionToX/webviewSlowdownFactor, webviewFromY, width, height - _nonWebViewHeight);
+    _webviewTo = CGRectMake(0, webviewToY, width, height-_nonWebViewHeight);
+    _screenshotTo = CGRectMake(transitionToX/screenshotSlowdownFactor, transitionToY, width, height);
+}
+
 - (void) slide:(CDVInvokedUrlCommand*)command {
+
+    NSDictionary *args = [command.arguments objectAtIndex:0];
+    NSTimeInterval duration = [[args objectForKey:@"duration"] doubleValue];
+    NSString *direction = [args objectForKey:@"direction"];
+    NSNumber *slowdownfactor = [args objectForKey:@"slowdownfactor"];
+    
+    self.transitionView.layer.shadowOpacity = 0;
+    
+    // duration/delay is passed in ms, but needs to be in sec here
+    duration = duration / 1000;
+
+    CGFloat lowerLayerAlpha = 0.4f; // TODO consider passing in
+    
+    // Perform the animations
+    // Note that all these animations happen simultaneously and have the same delay / duration
+    
+    // Animate the screenshot view:
+    
+    [UIView animateWithDuration:duration
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut // TODO: allow passing in?
+                     animations:^{
+                         [_screenShotImageView setFrame: _screenshotTo];
+                     }
+                     completion:^(BOOL finished) {
+                         [_screenShotImageView removeFromSuperview];
+                         CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+                         [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+                     }];
+    
+    // also fade out the screenshot a bit to give it some depth
+    if ([slowdownfactor intValue] != 1 && ([direction isEqualToString:@"left"] || [direction isEqualToString:@"up"])) {
+
+        [UIView animateWithDuration:duration
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseInOut
+                         animations:^{
+                             _screenShotImageView.alpha = lowerLayerAlpha;
+                         }
+                         completion:^(BOOL finished) {}];
+    }
+    
+
+    // Animate the webview:
+    
+    [UIView animateWithDuration:duration
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseInOut
+                     animations:^{
+                         [self.transitionView setFrame:_webviewTo];
+                     }
+                     completion:^(BOOL finished) {
+                         // It's fine to "remove" these even if they weren't added:
+                         [_screenShotImageViewTop removeFromSuperview];
+                         [_screenShotImageViewBottom removeFromSuperview];
+                     }];
+    
+    if ([slowdownfactor intValue] != 1 && [direction isEqualToString:@"right"] || [direction isEqualToString:@"down"]) {
+        self.transitionView.alpha = lowerLayerAlpha;
+        [UIView animateWithDuration:duration
+                              delay:0
+                            options:UIViewAnimationOptionCurveEaseInOut
+                         animations:^{
+                             self.transitionView.alpha = 1.0;
+                         }
+                         completion:^(BOOL finished) {}];
+    }
+
+}
+
+
+
+
+
+#pragma mark - Old shit:
+
+- (void) slideLikeAFool:(CDVInvokedUrlCommand*)command {
   _command = command;
   NSMutableDictionary *args = [command.arguments objectAtIndex:0];
   NSString *direction = [args objectForKey:@"direction"];
   NSTimeInterval duration = [[args objectForKey:@"duration"] doubleValue];
   NSTimeInterval delay = [[args objectForKey:@"iosdelay"] doubleValue];
-  NSString *href = [args objectForKey:@"href"];
   NSNumber *slowdownfactor = [args objectForKey:@"slowdownfactor"];
   NSNumber *fixedPixelsTopNum = [args objectForKey:@"fixedPixelsTop"];
   NSNumber *fixedPixelsBottomNum = [args objectForKey:@"fixedPixelsBottom"];
@@ -103,7 +329,7 @@
   // Since drawViewHierarchyInRect is slower than renderInContext we should only
   // use it to overcome the bug in WKWebView
   if (self.wkWebView != nil) {
-    [self.viewController.view drawViewHierarchyInRect:self.viewController.view.bounds afterScreenUpdates:NO];
+    [self.wkWebView drawViewHierarchyInRect:self.viewController.view.bounds afterScreenUpdates:NO];
   } else {
     [self.viewController.view.layer renderInContext:UIGraphicsGetCurrentContext()];
   }
@@ -154,7 +380,6 @@
     }
   }
   
-  if ([self loadHrefIfPassed:href]) {
     [UIView animateWithDuration:duration
                           delay:delay
                         options:UIViewAnimationOptionCurveEaseInOut // TODO: allow passing in?
@@ -204,7 +429,6 @@
                        completion:^(BOOL finished) {
                        }];
     }
-  }
 }
 
 - (void) drawer:(CDVInvokedUrlCommand*)command {
@@ -214,7 +438,6 @@
   NSString *origin = [args objectForKey:@"origin"];
   NSTimeInterval duration = [[args objectForKey:@"duration"] doubleValue];
   NSTimeInterval delay = [[args objectForKey:@"iosdelay"] doubleValue];
-  NSString *href = [args objectForKey:@"href"];
   
   // duration/delay is passed in ms, but needs to be in sec here
   duration = duration / 1000;
@@ -285,7 +508,6 @@
     self.transitionView.layer.shadowPath = shadowPath.CGPath;
   }
   
-  if ([self loadHrefIfPassed:href]) {
     if ([action isEqualToString:@"open"]) {
       [UIView animateWithDuration:duration
                             delay:delay
@@ -323,7 +545,6 @@
                          [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
                        }];
     }
-  }
 }
 
 - (void) flip:(CDVInvokedUrlCommand*)command {
@@ -332,7 +553,6 @@
   NSString *direction = [args objectForKey:@"direction"];
   NSTimeInterval duration = [[args objectForKey:@"duration"] doubleValue];
   NSTimeInterval delay = [[args objectForKey:@"iosdelay"] doubleValue];
-  NSString *href = [args objectForKey:@"href"];
   
   // duration is passed in ms, but needs to be in sec here
   duration = duration / 1000;
@@ -386,7 +606,6 @@
     return;
   }
   
-  if ([self loadHrefIfPassed:href]) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
       // remove the screenshot halfway during the transition
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (duration/2) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
@@ -401,7 +620,6 @@
                         [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
                       }];
     });
-  }
 }
 
 - (void) curl:(CDVInvokedUrlCommand*)command {
@@ -410,7 +628,6 @@
   NSString *direction = [args objectForKey:@"direction"];
   NSTimeInterval duration = [[args objectForKey:@"duration"] doubleValue];
   NSTimeInterval delay = [[args objectForKey:@"iosdelay"] doubleValue];
-  NSString *href = [args objectForKey:@"href"];
   
   // duration is passed in ms, but needs to be in sec here
   duration = duration / 1000;
@@ -444,12 +661,13 @@
     return;
   }
   
-  if ([self loadHrefIfPassed:href]) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
       // remove the screenshot halfway during the transition
       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (duration/2) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
         [_screenShotImageView removeFromSuperview];
       });
+      
       [UIView transitionWithView:self.viewController.view
                         duration:duration
                          options:animationOptions | UIViewAnimationOptionAllowAnimatedContent
@@ -459,7 +677,6 @@
                         [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
                       }];
     });
-  }
 }
 
 - (void) fade:(CDVInvokedUrlCommand*)command {
@@ -493,97 +710,107 @@
     UIViewAnimationOptions animationOptions;
     animationOptions = UIViewAnimationOptionTransitionCrossDissolve;
     
-    if ([self loadHrefIfPassed:href]) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-            // remove the screenshot halfway during the transition
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (duration/2) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-                [_screenShotImageView removeFromSuperview];
-            });
-            [UIView transitionWithView:self.viewController.view
-                              duration:duration
-                               options:animationOptions | UIViewAnimationOptionAllowAnimatedContent
-                            animations:^{}
-                            completion:^(BOOL finished) {
-                                CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
-                                [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
-                            }];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delay * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        // remove the screenshot halfway during the transition
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (duration/2) * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+            [_screenShotImageView removeFromSuperview];
         });
-    }
+        [UIView transitionWithView:self.viewController.view
+                          duration:duration
+                           options:animationOptions | UIViewAnimationOptionAllowAnimatedContent
+                        animations:^{}
+                        completion:^(BOOL finished) {
+                            CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK];
+                            [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
+                        }];
+    });
 }
 
-- (BOOL) loadHrefIfPassed:(NSString*) href {
-  if (href != nil && ![href isEqual:[NSNull null]]) {
-    if (![href hasPrefix:@"#"] && [href rangeOfString:@".html"].location != NSNotFound) {
-      // strip any params when looking for the file on the filesystem
-      NSString *bareFileName = href;
-      NSString *urlParams = nil;
-      
-      if (![bareFileName hasSuffix:@".html"]) {
-        NSRange range = [href rangeOfString:@".html"];
-        bareFileName = [href substringToIndex:range.location+5];
-        urlParams = [href substringFromIndex:range.location+5];
-      }
-      NSURL *url;
-      if (self.wkWebView != nil) {
-        NSString *filePath = bareFileName;
-        NSString *replaceWith = [@"/" stringByAppendingString:bareFileName];
-        filePath = [self.wkWebView.URL.absoluteString stringByReplacingOccurrencesOfString:self.wkWebView.URL.path withString:replaceWith];
-        url = [NSURL URLWithString:filePath];
-      } else {
-        NSString *filePath = [self.commandDelegate pathForResource:bareFileName];
-        if (filePath == nil) {
-          CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"file not found"];
-          [self.commandDelegate sendPluginResult:pluginResult callbackId:_command.callbackId];
-          return NO;
-        }
-        url = [NSURL fileURLWithPath: filePath];
-      }
+#pragma mark - Helper functions:
 
-      // re-attach the params when loading the url
-      if (urlParams != nil) {
-        NSString *absoluteURLString = [url absoluteString];
-        NSString *absoluteURLWithParams = [absoluteURLString stringByAppendingString: urlParams];
-        url = [NSURL URLWithString:absoluteURLWithParams];
-      }
-      
-      NSURLRequest *urlRequest = [NSURLRequest requestWithURL:url];
-      
-      // Utilize WKWebView for request if it exists
-      if (self.wkWebView != nil) {
-        [self.wkWebView loadRequest: urlRequest];
-      } else {
-        [self.webView loadRequest: urlRequest];
-      }
-    } else if (![href hasPrefix:@"#"]) {
-      CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"href must be null, a .html file or a #navigationhash"];
-      [self.commandDelegate sendPluginResult:pluginResult callbackId:_command.callbackId];
-      return NO;
-    } else {
-      // it's a hash, so load the url without any possible current hash
-      NSString *url = nil;
-      if (self.wkWebView != nil) {
-        url = self.wkWebView.URL.absoluteString;
-      } else {
-        url = self.webView.request.URL.absoluteString;
-      }
-      
-      // remove the # if it's still there
-      if ([url rangeOfString:@"#"].location != NSNotFound) {
-        NSRange range = [url rangeOfString:@"#"];
-        url = [url substringToIndex:range.location];
-      }
-      // attach the hash
-      url = [url stringByAppendingString:href];
-      // and load it
-      NSURLRequest *urlRequest = [NSURLRequest requestWithURL:[NSURL URLWithString:url]];
-      
-      if (self.wkWebView != nil) {
-        [self.wkWebView loadRequest: urlRequest];
-      } else {
-        [self.webView loadRequest: urlRequest];
-      }
-    }
-  }
-  return YES;
+- (bool) isLandscape {
+    return UIInterfaceOrientationIsLandscape([UIApplication sharedApplication].statusBarOrientation);
 }
+
+- (CGRect) switchCGRectOrientation:(CGRect)rect {
+    return CGRectMake(rect.origin.x, rect.origin.y, rect.size.height, rect.size.width);
+}
+
+//- (BOOL) loadHrefIfPassed:(NSString*) href {
+//    if (href != nil && ![href isEqual:[NSNull null]]) {
+//        if (![href hasPrefix:@"#"] && [href rangeOfString:@".html"].location != NSNotFound) {
+//            // strip any params when looking for the file on the filesystem
+//            NSString *bareFileName = href;
+//            NSString *urlParams = nil;
+//            
+//            if (![bareFileName hasSuffix:@".html"]) {
+//                NSRange range = [href rangeOfString:@".html"];
+//                bareFileName = [href substringToIndex:range.location+5];
+//                urlParams = [href substringFromIndex:range.location+5];
+//            }
+//            NSURL *url;
+//            if (self.wkWebView != nil) {
+//                NSString *filePath = bareFileName;
+//                NSString *replaceWith = [@"/" stringByAppendingString:bareFileName];
+//                filePath = [self.wkWebView.URL.absoluteString stringByReplacingOccurrencesOfString:self.wkWebView.URL.path withString:replaceWith];
+//                url = [NSURL URLWithString:filePath];
+//            } else {
+//                NSString *filePath = [self.commandDelegate pathForResource:bareFileName];
+//                if (filePath == nil) {
+//                    CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"file not found"];
+//                    [self.commandDelegate sendPluginResult:pluginResult callbackId:_command.callbackId];
+//                    return NO;
+//                }
+//                url = [NSURL fileURLWithPath: filePath];
+//            }
+//            
+//            // re-attach the params when loading the url
+//            if (urlParams != nil) {
+//                NSString *absoluteURLString = [url absoluteString];
+//                NSString *absoluteURLWithParams = [absoluteURLString stringByAppendingString: urlParams];
+//                url = [NSURL URLWithString:absoluteURLWithParams];
+//            }
+//            
+//            NSURLRequest *urlRequest = [NSURLRequest requestWithURL:url];
+//            
+//            // Utilize WKWebView for request if it exists
+//            if (self.wkWebView != nil) {
+//                [self.wkWebView loadRequest: urlRequest];
+//            } else {
+//                [self.webView loadRequest: urlRequest];
+//            }
+//        } else if (![href hasPrefix:@"#"]) {
+//            CDVPluginResult* pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"href must be null, a .html file or a #navigationhash"];
+//            [self.commandDelegate sendPluginResult:pluginResult callbackId:_command.callbackId];
+//            return NO;
+//        } else {
+//            // it's a hash, so load the url without any possible current hash
+//            NSString *url = nil;
+//            if (self.wkWebView != nil) {
+//                url = self.wkWebView.URL.absoluteString;
+//            } else {
+//                url = self.webView.request.URL.absoluteString;
+//            }
+//            
+//            // remove the # if it's still there
+//            if ([url rangeOfString:@"#"].location != NSNotFound) {
+//                NSRange range = [url rangeOfString:@"#"];
+//                url = [url substringToIndex:range.location];
+//            }
+//            // attach the hash
+//            url = [url stringByAppendingString:href];
+//            // and load it
+//            NSURLRequest *urlRequest = [NSURLRequest requestWithURL:[NSURL URLWithString:url]];
+//            
+//            if (self.wkWebView != nil) {
+//                [self.wkWebView loadRequest: urlRequest];
+//            } else {
+//                [self.webView loadRequest: urlRequest];
+//            }
+//        }
+//    }
+//    return YES;
+//}
+
 @end
